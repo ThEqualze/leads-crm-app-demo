@@ -229,15 +229,16 @@ async function startServer() {
     }
   });
 
-  const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
+  const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || (process.env.NODE_ENV === "production" ? "" : "admin123");
+  if (!ADMIN_PASSWORD && process.env.NODE_ENV === "production") {
+    console.error("FATAL: ADMIN_PASSWORD environment variable must be set in production.");
+  }
 
   function timingSafeCompare(a: string, b: string): boolean {
-    const bufA = Buffer.from(a, "utf-8");
-    const bufB = Buffer.from(b, "utf-8");
-    if (bufA.length !== bufB.length) {
-      return false;
-    }
-    return crypto.timingSafeEqual(bufA, bufB);
+    if (!a || !b) return false;
+    const hashA = crypto.createHash("sha256").update(a).digest();
+    const hashB = crypto.createHash("sha256").update(b).digest();
+    return crypto.timingSafeEqual(hashA, hashB);
   }
 
   function requireAdminAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
@@ -245,13 +246,9 @@ async function startServer() {
     let token = "";
 
     if (authHeader && authHeader.startsWith("Bearer ")) {
-      token = authHeader.substring(7);
+      token = authHeader.substring(7).trim();
     } else if (req.headers["x-admin-password"]) {
-      token = String(req.headers["x-admin-password"]);
-    } else if (req.body && req.body.password) {
-      token = String(req.body.password);
-    } else if (req.query && req.query.password) {
-      token = String(req.query.password);
+      token = String(req.headers["x-admin-password"]).trim();
     }
 
     if (!token || !timingSafeCompare(token, ADMIN_PASSWORD)) {
@@ -283,6 +280,13 @@ async function startServer() {
 
     if (leads.length === 0) {
       return res.status(400).json({ error: "leads array cannot be empty" });
+    }
+
+    const MAX_BATCH_SIZE = 500;
+    if (leads.length > MAX_BATCH_SIZE) {
+      return res.status(400).json({
+        error: `Import payload exceeds maximum batch size of ${MAX_BATCH_SIZE} leads`,
+      });
     }
 
     const ALLOWED_STATUSES = ["New", "Contacted", "Qualified", "Proposal", "Won", "Lost"];
