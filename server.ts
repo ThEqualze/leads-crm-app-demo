@@ -3,6 +3,7 @@ import { createServer as createViteServer } from "vite";
 import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -228,17 +229,75 @@ async function startServer() {
     }
   });
 
-  const ADMIN_PASSWORD = "admin123";
+  const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
 
-  app.post("/api/admin/import", (req, res) => {
-    const { password, leads } = req.body;
-
-    if (password !== ADMIN_PASSWORD) {
-      return res.status(401).json({ error: "Invalid admin password" });
+  function timingSafeCompare(a: string, b: string): boolean {
+    const bufA = Buffer.from(a, "utf-8");
+    const bufB = Buffer.from(b, "utf-8");
+    if (bufA.length !== bufB.length) {
+      return false;
     }
+    return crypto.timingSafeEqual(bufA, bufB);
+  }
+
+  function requireAdminAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+    const authHeader = req.headers.authorization;
+    let token = "";
+
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      token = authHeader.substring(7);
+    } else if (req.headers["x-admin-password"]) {
+      token = String(req.headers["x-admin-password"]);
+    } else if (req.body && req.body.password) {
+      token = String(req.body.password);
+    } else if (req.query && req.query.password) {
+      token = String(req.query.password);
+    }
+
+    if (!token || !timingSafeCompare(token, ADMIN_PASSWORD)) {
+      return res.status(401).json({ error: "Unauthorized: Invalid admin credentials" });
+    }
+
+    next();
+  }
+
+  function sanitizeCsvField(value: any): string {
+    if (value === null || value === undefined) {
+      return '""';
+    }
+    let str = String(value);
+    // Neutralize formula injection (=, +, -, @, \t, \r)
+    if (/^[=+\-@\t\r]/.test(str)) {
+      str = "'" + str;
+    }
+    // Escape internal double quotes
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+
+  app.post("/api/admin/import", requireAdminAuth, (req, res) => {
+    const { leads } = req.body;
 
     if (!Array.isArray(leads)) {
       return res.status(400).json({ error: "leads must be an array" });
+    }
+
+    if (leads.length === 0) {
+      return res.status(400).json({ error: "leads array cannot be empty" });
+    }
+
+    const ALLOWED_STATUSES = ["New", "Contacted", "Qualified", "Proposal", "Won", "Lost"];
+
+    for (let i = 0; i < leads.length; i++) {
+      const lead = leads[i];
+      if (!lead || typeof lead !== "object") {
+        return res.status(400).json({ error: `Invalid lead at index ${i}: must be an object` });
+      }
+      if (!lead.name || typeof lead.name !== "string" || !lead.name.trim()) {
+        return res.status(400).json({ error: `Invalid lead at index ${i}: name is required and must be non-empty` });
+      }
+      if (lead.status && !ALLOWED_STATUSES.includes(lead.status)) {
+        return res.status(400).json({ error: `Invalid status at index ${i}: must be one of ${ALLOWED_STATUSES.join(", ")}` });
+      }
     }
 
     try {
@@ -251,67 +310,68 @@ async function startServer() {
         const results = [];
         for (const lead of leadList) {
           const info = insertStmt.run(
-            lead.name,
-            lead.company || null,
-            lead.email || null,
-            lead.phone || null,
+            lead.name.trim(),
+            lead.company ? String(lead.company).trim() : null,
+            lead.email ? String(lead.email).trim() : null,
+            lead.phone ? String(lead.phone).trim() : null,
             lead.status || "New",
-            lead.value || 0,
-            lead.notes || ""
+            typeof lead.value === "number" && !isNaN(lead.value) ? lead.value : 0,
+            lead.notes ? String(lead.notes) : ""
           );
           results.push(info.lastInsertRowid);
-
-          console.debug(`[import] Imported lead: ${JSON.stringify(lead)}`);
         }
         return results;
       });
 
       const importedIds = insertMany(leads);
 
-      console.debug(`[import] Bulk import complete: ${importedIds.length} leads imported`);
+      console.log(`[import] Bulk import complete: ${importedIds.length} leads imported successfully`);
       res.status(201).json({
         message: `Successfully imported ${importedIds.length} leads`,
+        count: importedIds.length,
         ids: importedIds,
       });
     } catch (error: any) {
-      res.status(500).json({ error: "Import failed", details: error.message });
+      console.error("[import] Error performing bulk import");
+      res.status(500).json({ error: "Import failed" });
     }
   });
 
-  app.get("/api/admin/export", (req, res) => {
-    const { password } = req.query;
-
-    if (password !== ADMIN_PASSWORD) {
-      return res.status(401).json({ error: "Invalid admin password" });
-    }
-
+  app.get("/api/admin/export", requireAdminAuth, (req, res) => {
     try {
       const leads = db.prepare("SELECT * FROM leads ORDER BY created_at DESC").all();
 
-      const filename = (req.query.filename as string) || "export.csv";
-      console.debug(`[export] Exporting to filename: ${filename}`);
+      const requestedFilename = typeof req.query.filename === "string" ? req.query.filename : "leads_export.csv";
+      const safeBasename = path.basename(requestedFilename).replace(/[^a-zA-Z0-9_\-]/g, "") || "leads_export";
+      const finalFilename = safeBasename.endsWith(".csv") ? safeBasename : `${safeBasename}.csv`;
 
       const headers = "id,name,company,email,phone,status,value,notes,created_at\n";
       const rows = leads
-        .map(
-          (l: any) =>
-            `${l.id},"${l.name}","${l.company || ""}","${l.email || ""}","${l.phone || ""}","${l.status}",${l.value},"${l.notes || ""}","${l.created_at}"`
-        )
+        .map((l: any) => [
+          l.id,
+          sanitizeCsvField(l.name),
+          sanitizeCsvField(l.company),
+          sanitizeCsvField(l.email),
+          sanitizeCsvField(l.phone),
+          sanitizeCsvField(l.status),
+          typeof l.value === "number" ? l.value : 0,
+          sanitizeCsvField(l.notes),
+          sanitizeCsvField(l.created_at),
+        ].join(","))
         .join("\n");
 
-      const filePath = path.join(__dirname, filename);
+      console.log(`[export] Exported ${leads.length} leads to ${finalFilename}`);
 
-      fs.writeFileSync(filePath, headers + rows);
-
-      console.debug(`[export] Exported ${leads.length} leads: ${JSON.stringify(leads)}`);
-
-      res.download(filePath, filename);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${finalFilename}"`);
+      res.send(headers + rows);
     } catch (error: any) {
-      res.status(500).json({ error: "Export failed", details: error.message });
+      console.error("[export] Error generating export");
+      res.status(500).json({ error: "Export failed" });
     }
   });
 
-  app.get("/api/admin/stats", (req, res) => {
+  app.get("/api/admin/stats", requireAdminAuth, (req, res) => {
     try {
       const totalLeads = db.prepare("SELECT COUNT(*) as count FROM leads").get() as any;
       const byStatus = db.prepare("SELECT status, COUNT(*) as count FROM leads GROUP BY status").all();
@@ -319,7 +379,7 @@ async function startServer() {
       const recentLeads = db.prepare("SELECT * FROM leads ORDER BY created_at DESC LIMIT 10").all();
       const totalMeetings = db.prepare("SELECT COUNT(*) as count FROM meetings").get() as any;
 
-      console.debug(`[stats] Recent leads data: ${JSON.stringify(recentLeads)}`);
+      console.log(`[stats] Stats retrieved: total=${totalLeads.count}, meetings=${totalMeetings.count}`);
 
       res.json({
         total_leads: totalLeads.count,
@@ -329,7 +389,8 @@ async function startServer() {
         total_meetings: totalMeetings.count,
       });
     } catch (error: any) {
-      res.status(500).json({ error: "Failed to fetch stats", details: error.message });
+      console.error("[stats] Error fetching stats");
+      res.status(500).json({ error: "Failed to fetch stats" });
     }
   });
 
