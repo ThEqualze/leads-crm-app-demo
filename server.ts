@@ -231,7 +231,7 @@ async function startServer() {
 
   const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || (process.env.NODE_ENV === "production" ? "" : "admin123");
   if (!ADMIN_PASSWORD && process.env.NODE_ENV === "production") {
-    console.error("FATAL: ADMIN_PASSWORD environment variable must be set in production.");
+    throw new Error("FATAL: ADMIN_PASSWORD environment variable must be set in production.");
   }
 
   function timingSafeCompare(a: string, b: string): boolean {
@@ -263,8 +263,8 @@ async function startServer() {
       return '""';
     }
     let str = String(value);
-    // Neutralize formula injection (=, +, -, @, \t, \r)
-    if (/^[=+\-@\t\r]/.test(str)) {
+    // Neutralize formula injection (=, +, -, @, \t, \r), checking trimmed string for leading triggers
+    if (/^[=+\-@\t\r]/.test(str.trim())) {
       str = "'" + str;
     }
     // Escape internal double quotes
@@ -310,9 +310,15 @@ async function startServer() {
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
 
+      const insertNoteStmt = db.prepare(`
+        INSERT INTO lead_notes (lead_id, content, type)
+        VALUES (?, ?, ?)
+      `);
+
       const insertMany = db.transaction((leadList: any[]) => {
         const results = [];
         for (const lead of leadList) {
+          const notesContent = lead.notes ? String(lead.notes) : "";
           const info = insertStmt.run(
             lead.name.trim(),
             lead.company ? String(lead.company).trim() : null,
@@ -320,9 +326,14 @@ async function startServer() {
             lead.phone ? String(lead.phone).trim() : null,
             lead.status || "New",
             typeof lead.value === "number" && !isNaN(lead.value) ? lead.value : 0,
-            lead.notes ? String(lead.notes) : ""
+            notesContent
           );
-          results.push(info.lastInsertRowid);
+          const leadId = info.lastInsertRowid;
+          results.push(leadId);
+
+          if (notesContent.trim()) {
+            insertNoteStmt.run(leadId, notesContent.trim(), "general");
+          }
         }
         return results;
       });
@@ -336,7 +347,7 @@ async function startServer() {
         ids: importedIds,
       });
     } catch (error: any) {
-      console.error("[import] Error performing bulk import");
+      console.error("[import] Error performing bulk import:", error);
       res.status(500).json({ error: "Import failed" });
     }
   });
@@ -346,7 +357,7 @@ async function startServer() {
       const leads = db.prepare("SELECT * FROM leads ORDER BY created_at DESC").all();
 
       const requestedFilename = typeof req.query.filename === "string" ? req.query.filename : "leads_export.csv";
-      const safeBasename = path.basename(requestedFilename).replace(/[^a-zA-Z0-9_\-]/g, "") || "leads_export";
+      const safeBasename = path.basename(requestedFilename).replace(/[^a-zA-Z0-9_\-.]/g, "") || "leads_export.csv";
       const finalFilename = safeBasename.endsWith(".csv") ? safeBasename : `${safeBasename}.csv`;
 
       const headers = "id,name,company,email,phone,status,value,notes,created_at\n";
@@ -370,7 +381,7 @@ async function startServer() {
       res.setHeader("Content-Disposition", `attachment; filename="${finalFilename}"`);
       res.send(headers + rows);
     } catch (error: any) {
-      console.error("[export] Error generating export");
+      console.error("[export] Error generating export:", error);
       res.status(500).json({ error: "Export failed" });
     }
   });
@@ -393,7 +404,7 @@ async function startServer() {
         total_meetings: totalMeetings.count,
       });
     } catch (error: any) {
-      console.error("[stats] Error fetching stats");
+      console.error("[stats] Error fetching stats:", error);
       res.status(500).json({ error: "Failed to fetch stats" });
     }
   });
