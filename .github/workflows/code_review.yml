@@ -22,7 +22,7 @@ jobs:
 
       - name: Run security review
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY || secrets.GEMINI_API_KEY_CODEREVIEW }}
         run: |
           git config --global --add safe.directory $GITHUB_WORKSPACE
           uv run --project code_review_agent code_review_agent/review_agent.py .
