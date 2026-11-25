@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "skills": {
+    "code-review-and-quality": {
+      "source": "addyosmani/agent-skills",
+      "commit": "e997ac5b9a74eab332d5e9793bb38a38c8cfdd74",
+      "sourceType": "github",
+      "skillPath": "skills/code-review-and-quality/SKILL.md",
+      "computedHash": "c04b5cb0f38ea3aec41b0219478124a9b38d467c3cecd82cdf0ad694d9403628"
+    }
+  }
+}
